@@ -1,0 +1,785 @@
+name: Build APK
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: 8.7 }
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'EOF_X'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "PersonalTVHome"
+          include(":app")
+          EOF_X
+          cat > build.gradle.kts <<'EOF_X'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_X
+          cat > gradle.properties <<'EOF_X'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8
+          kotlin.daemon.jvmargs=-Xmx3g
+          EOF_X
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_X'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.personaltv.home"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.personaltv.home"; minSdk = 28; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              val bom = platform("androidx.compose:compose-bom:2024.06.00")
+              implementation(bom)
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.animation:animation")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.tv:tv-material:1.0.0")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          EOF_X
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:name="android.software.leanback" android:required="true" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <application android:label="Personal TV Home" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask"
+                      android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|uiMode|density">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".MediaListener" android:exported="true"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF_X
+          mkdir -p app/src/main/java/com/personaltv/home
+          cat > app/src/main/java/com/personaltv/home/MainActivity.kt <<'EOF_X'
+          package com.personaltv.home
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val state = HomeState(applicationContext)
+                  setContent { PersonalTvTheme { Root(state) } }
+              }
+              override fun onResume() { super.onResume(); MediaWatcher.start(applicationContext) }
+          }
+          EOF_X
+          mkdir -p app/src/main/java/com/personaltv/home
+          cat > app/src/main/java/com/personaltv/home/Data.kt <<'EOF_X'
+          package com.personaltv.home
+
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ActivityInfo
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.core.graphics.drawable.toBitmap
+          import org.json.JSONObject
+          import java.net.URL
+
+          /** Real TV artwork: the app's own leanback banner (16:9). Icon-on-brand-colour fallback if none. */
+          class AppEntry(val pkg: String, val label: String, val intent: Intent, val art: ImageBitmap)
+
+          data class Weather(val temp: Int, val code: Int) {
+              val text get() = when (code) {
+                  0 -> "Clear"; 1, 2 -> "Mostly clear"; 3 -> "Cloudy"; 45, 48 -> "Fog"
+                  in 51..67, in 80..82 -> "Rain"; in 71..77, 85, 86 -> "Snow"; in 95..99 -> "Storm"; else -> "Fair"
+              }
+          }
+
+          private val preferred = listOf(
+              "com.google.android.youtube.tv", "com.netflix.ninja", "com.amazon.amazonvideo.livingroom",
+              "com.spotify.tv.android", "com.google.android.youtube.tvmusic", "com.plexapp.android", "com.disney.disneyplus"
+          )
+
+          fun loadApps(ctx: Context): List<AppEntry> {
+              val pm = ctx.packageManager
+              val query = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)
+              val seen = HashSet<String>()
+              return pm.queryIntentActivities(query, 0).mapNotNull { ri ->
+                  val ai = ri.activityInfo
+                  if (ai.packageName == ctx.packageName || !seen.add(ai.packageName)) return@mapNotNull null
+                  val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)
+                      .setComponent(ComponentName(ai.packageName, ai.name))
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+                  AppEntry(ai.packageName, ri.loadLabel(pm).toString(), intent, artFor(pm, ai))
+              }.sortedBy { it.label.lowercase() }
+          }
+
+          private fun artFor(pm: PackageManager, ai: ActivityInfo): ImageBitmap {
+              val banner = ai.loadBanner(pm) ?: ai.applicationInfo.loadBanner(pm)
+              if (banner != null) return banner.toBitmap(320, 180).asImageBitmap()
+              val icon = ai.loadIcon(pm).toBitmap(112, 112)
+              val px = Bitmap.createScaledBitmap(icon, 1, 1, true).getPixel(0, 0)
+              val c = android.graphics.Color
+              val bg = c.rgb((c.red(px) * .55).toInt(), (c.green(px) * .55).toInt(), (c.blue(px) * .55).toInt())
+              val out = Bitmap.createBitmap(320, 180, Bitmap.Config.ARGB_8888)
+              Canvas(out).apply { drawColor(bg); drawBitmap(icon, 104f, 34f, null) }
+              return out.asImageBitmap()
+          }
+
+          /** Open-Meteo: no API key. Change the default coordinates (or wire up a location source). */
+          fun fetchWeather(lat: Double, lon: Double): Weather? = runCatching {
+              val url = "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&current=temperature_2m,weather_code&timezone=auto"
+              val cur = JSONObject(URL(url).readText()).getJSONObject("current")
+              Weather(Math.round(cur.getDouble("temperature_2m")).toInt(), cur.getInt("weather_code"))
+          }.getOrNull()
+
+          class HomeState(private val ctx: Context) {
+              private val prefs = ctx.getSharedPreferences("ptv", Context.MODE_PRIVATE)
+              var apps by mutableStateOf(emptyList<AppEntry>())
+              var weather by mutableStateOf<Weather?>(null)
+              var reload by mutableIntStateOf(0)
+              var pinned by mutableStateOf(prefs.getString("pinned", "")!!.split(",").filter { it.isNotBlank() })
+                  private set
+              var scene by mutableIntStateOf(prefs.getInt("scene", 0)); private set
+              var glass by mutableIntStateOf(prefs.getInt("glass", 1)); private set
+              var musicBackdrop by mutableStateOf(prefs.getBoolean("musicBg", true)); private set
+              var saved by mutableStateOf(prefs.getString("saved", "")!!.split("|").filter { it.isNotBlank() })
+              val collections = emptyList<String>()
+              val lat get() = prefs.getFloat("lat", 23.81f).toDouble()
+              val lon get() = prefs.getFloat("lon", 90.41f).toDouble()
+
+              val favorites: List<AppEntry> get() {
+                  if (pinned.isNotEmpty()) return pinned.mapNotNull { p -> apps.find { it.pkg == p } }
+                  val pref = preferred.mapNotNull { p -> apps.find { it.pkg == p } }
+                  return (pref + apps.filter { it !in pref }).take(10)
+              }
+              fun isPinned(a: AppEntry) = favorites.any { it.pkg == a.pkg }
+              fun togglePin(a: AppEntry) {
+                  val cur = favorites.map { it.pkg }
+                  pinned = if (a.pkg in cur) cur - a.pkg else cur + a.pkg
+                  prefs.edit().putString("pinned", pinned.joinToString(",")).apply()
+              }
+              fun setScene(i: Int) { scene = i; prefs.edit().putInt("scene", i).apply() }
+              fun setGlass(i: Int) { glass = i; prefs.edit().putInt("glass", i).apply() }
+              fun setMusicBackdrop(b: Boolean) { musicBackdrop = b; prefs.edit().putBoolean("musicBg", b).apply() }
+          }
+          EOF_X
+          mkdir -p app/src/main/java/com/personaltv/home
+          cat > app/src/main/java/com/personaltv/home/Media.kt <<'EOF_X'
+          package com.personaltv.home
+
+          import android.content.ComponentName
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.media.MediaMetadata
+          import android.media.session.MediaController
+          import android.media.session.MediaSessionManager
+          import android.media.session.PlaybackState
+          import android.service.notification.NotificationListenerService
+          import kotlinx.coroutines.flow.MutableStateFlow
+
+          /** Empty on purpose: enabling notification access for this service lets us read active media sessions. */
+          class MediaListener : NotificationListenerService()
+
+          class NowPlaying(
+              val title: String, val artist: String, val art: Bitmap?, val soft: Bitmap?,
+              val playing: Boolean, val durationMs: Long, val controller: MediaController
+          )
+
+          object MediaWatcher {
+              val now = MutableStateFlow<NowPlaying?>(null)
+              private var started = false
+              private var current: MediaController? = null
+              private var lastArt: Bitmap? = null
+              private var lastSoft: Bitmap? = null
+
+              private val cb = object : MediaController.Callback() {
+                  override fun onMetadataChanged(metadata: MediaMetadata?) = publish()
+                  override fun onPlaybackStateChanged(state: PlaybackState?) = publish()
+                  override fun onSessionDestroyed() { current = null; now.value = null }
+              }
+
+              fun start(ctx: Context) {
+                  if (started) return
+                  started = true
+                  val msm = ctx.getSystemService(MediaSessionManager::class.java)
+                  val cn = ComponentName(ctx, MediaListener::class.java)
+                  try {
+                      msm.addOnActiveSessionsChangedListener({ pick(it.orEmpty()) }, cn)
+                      pick(msm.getActiveSessions(cn))
+                  } catch (_: SecurityException) { started = false } // notification access not granted yet
+              }
+
+              private fun isMusic(c: MediaController): Boolean {
+                  val st = c.playbackState?.state
+                  val live = st == PlaybackState.STATE_PLAYING || st == PlaybackState.STATE_PAUSED || st == PlaybackState.STATE_BUFFERING
+                  val md = c.metadata ?: return false
+                  return live && (!md.getString(MediaMetadata.METADATA_KEY_ARTIST).isNullOrBlank() ||
+                      !md.getString(MediaMetadata.METADATA_KEY_ALBUM).isNullOrBlank())
+              }
+
+              private fun pick(list: List<MediaController>) {
+                  val music = list.filter { isMusic(it) }
+                  val c = music.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING } ?: music.firstOrNull()
+                  if (c?.sessionToken != current?.sessionToken) {
+                      current?.unregisterCallback(cb); current = c; c?.registerCallback(cb)
+                  }
+                  publish()
+              }
+
+              private fun publish() {
+                  val c = current ?: run { now.value = null; return }
+                  val md = c.metadata
+                  if (md == null || !isMusic(c)) { now.value = null; return }
+                  val art = md.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) ?: md.getBitmap(MediaMetadata.METADATA_KEY_ART)
+                  if (art !== lastArt) {  // tiny upscaled bitmap = cheap, buttery blur on every Android version
+                      lastArt = art; lastSoft = art?.let { Bitmap.createScaledBitmap(it, 24, 24, true) }
+                  }
+                  now.value = NowPlaying(
+                      md.getString(MediaMetadata.METADATA_KEY_TITLE) ?: "Unknown",
+                      md.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: "",
+                      art, lastSoft, c.playbackState?.state == PlaybackState.STATE_PLAYING,
+                      md.getLong(MediaMetadata.METADATA_KEY_DURATION), c
+                  )
+              }
+          }
+          EOF_X
+          mkdir -p app/src/main/java/com/personaltv/home
+          cat > app/src/main/java/com/personaltv/home/Ui.kt <<'EOF_X'
+          package com.personaltv.home
+
+          import android.os.Build
+          import androidx.compose.animation.core.*
+          import androidx.compose.foundation.*
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.rounded.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.*
+          import androidx.compose.ui.draw.*
+          import androidx.compose.ui.focus.onFocusChanged
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.*
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.layout.onGloballyPositioned
+          import androidx.compose.ui.layout.positionInRoot
+          import androidx.compose.ui.platform.LocalConfiguration
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.Font
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.*
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.tv.material3.Icon
+          import androidx.tv.material3.MaterialTheme
+          import androidx.tv.material3.Text
+          import androidx.tv.material3.darkColorScheme
+          import kotlin.math.sin
+
+          // ───────── Typography ─────────
+          val Inter = FontFamily(
+              Font(R.font.inter_regular, FontWeight.Normal),
+              Font(R.font.inter_medium, FontWeight.Medium),
+              Font(R.font.inter_semibold, FontWeight.SemiBold)
+          )
+          val SoftWhite = Color(0xFFF3F5F9)
+          private val textShadow = Shadow(Color.Black.copy(.35f), Offset(0f, 2f), 14f)
+
+          object T {
+              val display = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Medium, fontSize = 34.sp, letterSpacing = (-0.5).sp, color = SoftWhite, shadow = textShadow)
+              val clock = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Medium, fontSize = 34.sp, fontFeatureSettings = "tnum", color = SoftWhite, shadow = textShadow)
+              val weather = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Medium, fontSize = 28.sp, fontFeatureSettings = "tnum", color = SoftWhite, shadow = textShadow)
+              val title = TextStyle(fontFamily = Inter, fontWeight = FontWeight.SemiBold, fontSize = 22.sp, color = SoftWhite)
+              val body = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 18.sp, color = SoftWhite.copy(.72f))
+              val label = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Medium, fontSize = 17.sp, color = SoftWhite)
+          }
+
+          @Composable
+          fun PersonalTvTheme(content: @Composable () -> Unit) =
+              MaterialTheme(colorScheme = darkColorScheme(primary = SoftWhite, onSurface = SoftWhite)) { content() }
+
+          // ───────── Backdrop: scenery, or the blurred album art ─────────
+          sealed interface Backdrop {
+              data class Scene(val index: Int) : Backdrop
+              data class Art(val soft: ImageBitmap) : Backdrop
+          }
+          val LocalBackdrop = compositionLocalOf<Backdrop> { Backdrop.Scene(0) }
+          val SceneNames = listOf("Alpine Dusk", "Coast Dawn", "Desert Haze")
+
+          private class SceneSpec(val sky: List<Color>, val ridges: List<Color>, val sun: Color)
+          private val scenes = listOf(
+              SceneSpec(listOf(0xFF1B2A49, 0xFF6B6FA3, 0xFFF0A98B).map(::Color), listOf(0xFF4A5885, 0xFF2D3860, 0xFF1A2240).map(::Color), Color(0xFFFFE2C2)),
+              SceneSpec(listOf(0xFF2C5A7A, 0xFF7FB2C4, 0xFFF6D9B0).map(::Color), listOf(0xFF5B8FA3, 0xFF356A80, 0xFF1F4558).map(::Color), Color(0xFFFFF1D6)),
+              SceneSpec(listOf(0xFF3A2748, 0xFFB5586B, 0xFFF6B37A).map(::Color), listOf(0xFF8A4563, 0xFF5C3355, 0xFF33203F).map(::Color), Color(0xFFFFD9A8))
+          )
+
+          /** Procedural scenery. To use real photography, swap this for an Image(painterResource(R.drawable.x)). */
+          @Composable
+          fun SceneCanvas(index: Int, modifier: Modifier = Modifier) {
+              val s = scenes[index.coerceIn(0, scenes.lastIndex)]
+              Canvas(modifier) {
+                  drawRect(Brush.verticalGradient(s.sky))
+                  drawCircle(Brush.radialGradient(listOf(s.sun.copy(.9f), s.sun.copy(.0f)), Offset(size.width * .7f, size.height * .5f), size.height * .45f),
+                      size.height * .45f, Offset(size.width * .7f, size.height * .5f))
+                  s.ridges.forEachIndexed { i, c ->
+                      val p = Path().apply {
+                          moveTo(0f, size.height)
+                          var x = 0f
+                          while (x <= size.width) {
+                              val f = 0.0016f + i * .0007f; val ph = i * 1.9f
+                              val y = size.height * (.50f + i * .12f) + size.height * (.07f - i * .012f) *
+                                  (sin(x * f + ph) * .6f + sin(x * f * 2.3f + ph * 1.7f) * .3f + sin(x * f * 5.1f) * .1f)
+                              lineTo(x, y); x += 8f
+                          }
+                          lineTo(size.width, size.height); close()
+                      }
+                      drawPath(p, c)
+                  }
+              }
+          }
+
+          @Composable
+          fun BackdropLayer(b: Backdrop, modifier: Modifier = Modifier.fillMaxSize()) = when (b) {
+              is Backdrop.Scene -> SceneCanvas(b.index, modifier)
+              is Backdrop.Art -> Box(modifier) {
+                  Image(b.soft, null, Modifier.fillMaxSize().graphicsLayer { scaleX = 1.3f; scaleY = 1.3f },
+                      contentScale = ContentScale.Crop, filterQuality = FilterQuality.High)
+                  Box(Modifier.fillMaxSize().background(Color.Black.copy(.3f)))
+              }
+          }
+
+          // ───────── Glass ─────────
+          /** Real glass: the same backdrop, blurred and aligned to screen coordinates inside the shape, plus a light tint and a fine bright edge. */
+          @Composable
+          fun GlassSurface(
+              modifier: Modifier, shape: Shape, strength: Int,
+              contentAlignment: Alignment = Alignment.TopStart, content: @Composable BoxScope.() -> Unit
+          ) {
+              val backdrop = LocalBackdrop.current
+              val cfg = LocalConfiguration.current
+              var pos by remember { mutableStateOf(IntOffset.Zero) }
+              val blurOk = Build.VERSION.SDK_INT >= 31       // RenderEffect needs Android 12+
+              val tint = listOf(.05f, .11f, .19f)[strength.coerceIn(0, 2)] + if (blurOk) 0f else .09f
+              Box(
+                  modifier
+                      .shadow(36.dp, shape, ambientColor = Color.Black.copy(.2f), spotColor = Color.Black.copy(.45f))
+                      .clip(shape)
+                      .onGloballyPositioned { pos = it.positionInRoot().round() },
+                  contentAlignment = contentAlignment
+              ) {
+                  Box(Modifier.matchParentSize()) {
+                      Box(Modifier.requiredSize(cfg.screenWidthDp.dp, cfg.screenHeightDp.dp)
+                          .offset { IntOffset(-pos.x, -pos.y) }
+                          .then(if (blurOk) Modifier.blur(30.dp) else Modifier)) { BackdropLayer(backdrop) }
+                  }
+                  Box(Modifier.matchParentSize().background(Brush.verticalGradient(listOf(Color.White.copy(tint + .04f), Color.White.copy(tint * .6f)))))
+                  Box(Modifier.matchParentSize().border(1.dp, Brush.verticalGradient(listOf(Color.White.copy(.5f), Color.White.copy(.06f), Color.White.copy(.16f))), shape))
+                  content()
+              }
+          }
+
+          // ───────── One focus treatment for everything ─────────
+          @OptIn(ExperimentalFoundationApi::class)
+          fun Modifier.tvFocusable(
+              shape: Shape, scaleTo: Float = 1.06f, fill: Boolean = false,
+              onLongClick: (() -> Unit)? = null, onClick: () -> Unit
+          ): Modifier = composed {
+              var focused by remember { mutableStateOf(false) }
+              val scale by animateFloatAsState(if (focused) scaleTo else 1f, spring(.75f, 380f), label = "scale")
+              val a by animateFloatAsState(if (focused) 1f else 0f, tween(200), label = "ring")
+              val lift by animateDpAsState(if (focused) 20.dp else 0.dp, tween(260), label = "lift")
+              this.graphicsLayer { scaleX = scale; scaleY = scale }
+                  .shadow(lift, shape, ambientColor = Color.Black.copy(.3f), spotColor = Color.Black.copy(.5f))
+                  .onFocusChanged { focused = it.isFocused }
+                  .clip(shape)
+                  .combinedClickable(onLongClick = onLongClick, onClick = onClick)
+                  .then(if (fill) Modifier.background(Color.White.copy(a * .14f)) else Modifier)
+                  .border(2.dp, SoftWhite.copy(a * .92f), shape)
+          }
+
+          // ───────── Shared components ─────────
+          val TileShape = RoundedCornerShape(16.dp)
+
+          @Composable
+          fun ArtTile(app: AppEntry, w: Dp, h: Dp, modifier: Modifier = Modifier, onLongClick: (() -> Unit)? = null, onClick: () -> Unit) {
+              Image(app.art, app.label, modifier.size(w, h).tvFocusable(TileShape, 1.08f, onLongClick = onLongClick, onClick = onClick),
+                  contentScale = ContentScale.Crop)
+          }
+
+          @Composable
+          fun GlassCircleButton(icon: ImageVector, glass: Int, size: Dp = 56.dp, onClick: () -> Unit) =
+              GlassSurface(Modifier.size(size).tvFocusable(CircleShape, 1.1f, onClick = onClick), CircleShape, glass, Alignment.Center) {
+                  Icon(icon, null, Modifier.size(size * .45f), tint = SoftWhite)
+              }
+
+          @Composable
+          fun Pill(text: String, selected: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
+              val shape = RoundedCornerShape(24.dp)
+              Box(modifier.height(48.dp).tvFocusable(shape, 1.04f, fill = true, onClick = onClick)
+                  .background(Color.White.copy(if (selected) .22f else .06f)).padding(horizontal = 20.dp), Alignment.Center) {
+                  Text(text, style = T.label)
+              }
+          }
+
+          @Composable
+          fun QuietEmpty(icon: ImageVector, title: String, hint: String) = Row(
+              Modifier.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically
+          ) {
+              Icon(icon, null, Modifier.size(32.dp), tint = SoftWhite.copy(.5f))
+              Spacer(Modifier.width(16.dp))
+              Column { Text(title, style = T.title.copy(color = SoftWhite.copy(.85f))); Text(hint, style = T.body) }
+          }
+          EOF_X
+          mkdir -p app/src/main/java/com/personaltv/home
+          cat > app/src/main/java/com/personaltv/home/Screens.kt <<'EOF_X'
+          package com.personaltv.home
+
+          import android.content.*
+          import android.net.Uri
+          import android.os.SystemClock
+          import android.provider.Settings
+          import androidx.activity.compose.BackHandler
+          import androidx.compose.animation.*
+          import androidx.compose.animation.core.tween
+          import androidx.compose.foundation.*
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.items
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.rounded.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.*
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.focus.FocusRequester
+          import androidx.compose.ui.focus.focusRequester
+          import androidx.compose.ui.graphics.*
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.tv.material3.Icon
+          import androidx.tv.material3.Text
+          import kotlinx.coroutines.*
+          import java.util.Date
+
+          enum class Screen { Home, Apps, MySpace }
+          enum class Panel { Main, Wallpapers, Appearance }
+
+          @Composable
+          fun Root(s: HomeState) {
+              val ctx = LocalContext.current
+              val now by MediaWatcher.now.collectAsState()
+              var screen by remember { mutableStateOf(Screen.Home) }
+              var panelOpen by remember { mutableStateOf(false) }
+              var panel by remember { mutableStateOf(Panel.Main) }
+
+              LaunchedEffect(s.reload) { s.apps = withContext(Dispatchers.IO) { loadApps(ctx) } }
+              LaunchedEffect(Unit) { while (true) { withContext(Dispatchers.IO) { fetchWeather(s.lat, s.lon) }?.let { s.weather = it }; delay(30 * 60_000L) } }
+              DisposableEffect(Unit) {
+                  val r = object : BroadcastReceiver() { override fun onReceive(c: Context?, i: Intent?) { s.reload++ } }
+                  ctx.registerReceiver(r, IntentFilter().apply { addAction(Intent.ACTION_PACKAGE_ADDED); addAction(Intent.ACTION_PACKAGE_REMOVED); addDataScheme("package") })
+                  onDispose { ctx.unregisterReceiver(r) }
+              }
+
+              val soft = now?.soft
+              val backdrop = remember(soft, s.scene, s.musicBackdrop) {
+                  if (soft != null && s.musicBackdrop) Backdrop.Art(soft.asImageBitmap()) else Backdrop.Scene(s.scene)
+              }
+              fun launch(i: Intent) = runCatching { ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+              fun go(to: Screen) { screen = to; panelOpen = false; panel = Panel.Main }
+
+              BackHandler(panelOpen) { if (panel != Panel.Main) panel = Panel.Main else panelOpen = false }
+              BackHandler(!panelOpen && screen != Screen.Home) { screen = Screen.Home }
+
+              Box(Modifier.fillMaxSize().background(Color.Black)) {
+                  Crossfade(backdrop, animationSpec = tween(900), label = "bg") { BackdropLayer(it) }
+                  val extra by animateFloatAsState(if (screen == Screen.Home) 0f else .3f, tween(500), label = "scrim")
+                  Box(Modifier.fillMaxSize().background(Brush.verticalGradient(
+                      0f to Color.Black.copy(.28f + extra), .25f to Color.Black.copy(extra), .7f to Color.Black.copy(extra), 1f to Color.Black.copy(.22f + extra))))
+
+                  CompositionLocalProvider(LocalBackdrop provides backdrop) {
+                      AnimatedContent(screen, transitionSpec = {
+                          (fadeIn(tween(420)) + scaleIn(tween(420), .98f)) togetherWith fadeOut(tween(240))
+                      }, label = "screen") { sc ->
+                          when (sc) {
+                              Screen.Home -> HomeScreen(s, now, !panelOpen, { panelOpen = true }, { go(Screen.Apps) }) { launch(it.intent) }
+                              Screen.Apps -> AppsScreen(s) { launch(it.intent) }
+                              Screen.MySpace -> MySpaceScreen(s) { go(Screen.Home) }
+                          }
+                      }
+                      AnimatedVisibility(panelOpen, Modifier.fillMaxSize(),
+                          enter = slideInHorizontally(tween(450)) { it / 2 } + fadeIn(tween(350)),
+                          exit = slideOutHorizontally(tween(300)) { it / 2 } + fadeOut(tween(250))) {
+                          SettingsPanel(s, panel, { panel = it }, ::go,
+                              system = { launch(Intent(Settings.ACTION_SETTINGS)) },
+                              discover = { ctx.packageManager.getLeanbackLaunchIntentForPackage("com.google.android.apps.tv.launcherx")?.let { launch(it) } },
+                              search = { if (launch(Intent(Intent.ACTION_ASSIST)).isFailure) launch(Intent(Intent.ACTION_WEB_SEARCH)) },
+                              musicAccess = { launch(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")) })
+                      }
+                  }
+              }
+          }
+
+          // ───────── Home ─────────
+          @Composable
+          fun HomeScreen(s: HomeState, now: NowPlaying?, focusDock: Boolean, onSettings: () -> Unit, onAllApps: () -> Unit, launch: (AppEntry) -> Unit) {
+              Box(Modifier.fillMaxSize()) {
+                  Row(Modifier.fillMaxWidth().padding(horizontal = 64.dp, vertical = 40.dp), verticalAlignment = Alignment.CenterVertically) {
+                      WeatherBlock(s.weather)
+                      Spacer(Modifier.weight(1f))
+                      Clock()
+                      Spacer(Modifier.width(28.dp))
+                      GlassCircleButton(Icons.Rounded.Settings, s.glass, onClick = onSettings)
+                  }
+                  Column(Modifier.align(Alignment.BottomCenter).padding(horizontal = 64.dp).padding(bottom = 56.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+                      now?.let { NowPlayingCard(it, s.glass) }
+                      Dock(s, focusDock, onAllApps, launch)
+                  }
+              }
+          }
+
+          @Composable
+          fun Dock(s: HomeState, focusDock: Boolean, onAllApps: () -> Unit, launch: (AppEntry) -> Unit) {
+              val favs = s.favorites
+              val fr = remember { FocusRequester() }
+              LaunchedEffect(favs.firstOrNull()?.pkg, focusDock) { if (focusDock && favs.isNotEmpty()) { delay(250); runCatching { fr.requestFocus() } } }
+              GlassSurface(Modifier.fillMaxWidth(), RoundedCornerShape(40.dp), s.glass) {
+                  LazyRow(contentPadding = PaddingValues(18.dp), horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                      items(favs, key = { it.pkg }) { a ->
+                          ArtTile(a, 144.dp, 84.dp, if (a === favs.first()) Modifier.focusRequester(fr) else Modifier) { launch(a) }
+                      }
+                      item {
+                          Box(Modifier.size(84.dp).tvFocusable(TileShape, 1.08f, onClick = onAllApps).background(Color.White.copy(.14f)), Alignment.Center) {
+                              Icon(Icons.Rounded.Apps, "All apps", Modifier.size(36.dp), tint = SoftWhite)
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun WeatherBlock(w: Weather?) {
+              if (w == null) return
+              val icon = when (w.code) { 0, 1, 2 -> Icons.Rounded.WbSunny; in 51..67, in 80..82 -> Icons.Rounded.WaterDrop
+                  in 71..77 -> Icons.Rounded.AcUnit; in 95..99 -> Icons.Rounded.Bolt; else -> Icons.Rounded.Cloud }
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                  Icon(icon, null, Modifier.size(30.dp), tint = SoftWhite)
+                  Spacer(Modifier.width(12.dp)); Text("${w.temp}°", style = T.weather)
+                  Spacer(Modifier.width(12.dp)); Text(w.text, style = T.body)
+              }
+          }
+
+          @Composable
+          fun Clock() {
+              val ctx = LocalContext.current
+              val fmt = remember { android.text.format.DateFormat.getTimeFormat(ctx) }
+              var t by remember { mutableStateOf(Date()) }
+              LaunchedEffect(Unit) { while (true) { t = Date(); delay(60_000L - System.currentTimeMillis() % 60_000L + 50) } }
+              Text(fmt.format(t), style = T.clock)
+          }
+
+          // ───────── Music ─────────
+          @Composable
+          fun NowPlayingCard(np: NowPlaying, glass: Int) {
+              var progress by remember { mutableFloatStateOf(0f) }
+              LaunchedEffect(np.controller, np.durationMs) {
+                  while (true) {
+                      val st = np.controller.playbackState
+                      if (st != null && np.durationMs > 0) {
+                          val el = if (st.state == android.media.session.PlaybackState.STATE_PLAYING) (SystemClock.elapsedRealtime() - st.lastPositionUpdateTime) * st.playbackSpeed else 0f
+                          progress = ((st.position + el) / np.durationMs).coerceIn(0f, 1f)
+                      }
+                      delay(500)
+                  }
+              }
+              val tc = np.controller.transportControls
+              GlassSurface(Modifier.widthIn(max = 620.dp), RoundedCornerShape(32.dp), glass) {
+                  Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                      np.art?.let { Image(it.asImageBitmap(), null, Modifier.size(112.dp).clip(RoundedCornerShape(20.dp)), contentScale = ContentScale.Crop) }
+                      Spacer(Modifier.width(20.dp))
+                      Column(Modifier.weight(1f)) {
+                          Text(np.title, style = T.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                          Text(np.artist, style = T.body, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                          Spacer(Modifier.height(12.dp))
+                          Box(Modifier.fillMaxWidth().height(4.dp).clip(CircleShape).background(Color.White.copy(.2f))) {
+                              Box(Modifier.fillMaxWidth(progress).fillMaxHeight().background(SoftWhite))
+                          }
+                          Spacer(Modifier.height(12.dp))
+                          Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                              GlassCircleButton(Icons.Rounded.SkipPrevious, glass, 48.dp) { tc.skipToPrevious() }
+                              GlassCircleButton(if (np.playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, glass, 48.dp) { if (np.playing) tc.pause() else tc.play() }
+                              GlassCircleButton(Icons.Rounded.SkipNext, glass, 48.dp) { tc.skipToNext() }
+                          }
+                      }
+                  }
+              }
+          }
+
+          // ───────── Apps ─────────
+          @Composable
+          fun AppsScreen(s: HomeState, launch: (AppEntry) -> Unit) {
+              Column(Modifier.fillMaxSize().padding(top = 48.dp)) {
+                  Column(Modifier.padding(horizontal = 64.dp)) {
+                      Text("Apps", style = T.display)
+                      Text("Hold OK on an app to pin it to Home, or unpin it.", style = T.body)
+                  }
+                  Spacer(Modifier.height(28.dp))
+                  LazyVerticalGrid(GridCells.Adaptive(208.dp), contentPadding = PaddingValues(horizontal = 64.dp, vertical = 16.dp),
+                      horizontalArrangement = Arrangement.spacedBy(28.dp), verticalArrangement = Arrangement.spacedBy(32.dp)) {
+                      items(s.apps, key = { it.pkg }) { a ->
+                          Column {
+                              ArtTile(a, 208.dp, 117.dp, onLongClick = { s.togglePin(a) }) { launch(a) }
+                              Spacer(Modifier.height(12.dp))
+                              Text(a.label, style = T.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                              if (s.isPinned(a)) Text("On Home", style = T.body.copy(fontSize = 14.sp))
+                          }
+                      }
+                  }
+              }
+          }
+
+          // ───────── My Space ─────────
+          @Composable
+          fun MySpaceScreen(s: HomeState, goHome: () -> Unit) {
+              Column(Modifier.fillMaxSize().padding(horizontal = 64.dp, vertical = 48.dp), verticalArrangement = Arrangement.spacedBy(36.dp)) {
+                  Text("My Space", style = T.display)
+                  Section("Saved titles") {
+                      if (s.saved.isEmpty()) QuietEmpty(Icons.Rounded.Bookmark, "Nothing saved yet", "Titles you save will wait here.")
+                      else LazyRow(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                          items(s.saved) { t ->
+                              GlassSurface(Modifier.size(208.dp, 117.dp).tvFocusable(TileShape, 1.06f) {}, TileShape, s.glass, Alignment.BottomStart) {
+                                  Text(t, style = T.label, modifier = Modifier.padding(16.dp), maxLines = 2)
+                              }
+                          }
+                      }
+                  }
+                  Section("Collections") {
+                      if (s.collections.isEmpty()) QuietEmpty(Icons.Rounded.Collections, "No collections", "Group titles into collections to find them faster.")
+                  }
+              }
+          }
+
+          @Composable
+          private fun Section(title: String, content: @Composable () -> Unit) {
+              Column(verticalArrangement = Arrangement.spacedBy(14.dp)) { Text(title, style = T.title); content() }
+          }
+
+          // ───────── Settings side panel ─────────
+          @Composable
+          fun SettingsPanel(
+              s: HomeState, panel: Panel, setPanel: (Panel) -> Unit, go: (Screen) -> Unit,
+              system: () -> Unit, discover: () -> Unit, search: () -> Unit, musicAccess: () -> Unit
+          ) {
+              Box(Modifier.fillMaxSize().padding(28.dp), Alignment.CenterEnd) {
+                  GlassSurface(Modifier.width(460.dp).fillMaxHeight(), RoundedCornerShape(36.dp), s.glass) {
+                      AnimatedContent(panel, transitionSpec = { fadeIn(tween(300)) togetherWith fadeOut(tween(160)) }, label = "panel") { p ->
+                          val fr = remember { FocusRequester() }
+                          LaunchedEffect(p) { delay(200); runCatching { fr.requestFocus() } }
+                          LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(24.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                              when (p) {
+                                  Panel.Main -> {
+                                      item { Text("Settings", style = T.display.copy(fontSize = 30.sp), modifier = Modifier.padding(bottom = 12.dp)) }
+                                      item { Row2(Icons.Rounded.Cast, "Chromecast settings", "Network, display, accounts, system", Modifier.focusRequester(fr), system) }
+                                      item { Label("Go to") }
+                                      item { Row2(Icons.Rounded.Home, "Home") { go(Screen.Home) } }
+                                      item { Row2(Icons.Rounded.Explore, "Discover", onClick = discover) }
+                                      item { Row2(Icons.Rounded.Bookmarks, "My Space") { go(Screen.MySpace) } }
+                                      item { Row2(Icons.Rounded.Apps, "Apps") { go(Screen.Apps) } }
+                                      item { Row2(Icons.Rounded.Search, "Search", onClick = search) }
+                                      item { Label("Personalise") }
+                                      item { Row2(Icons.Rounded.Image, "Wallpapers") { setPanel(Panel.Wallpapers) } }
+                                      item { Row2(Icons.Rounded.Palette, "Appearance") { setPanel(Panel.Appearance) } }
+                                      item { Row2(Icons.Rounded.MusicNote, "Music backdrop access", "Allow notification access to show album art", onClick = musicAccess) }
+                                  }
+                                  Panel.Wallpapers -> {
+                                      item { Row2(Icons.Rounded.ChevronLeft, "Wallpapers", modifier = Modifier.focusRequester(fr)) { setPanel(Panel.Main) } }
+                                      items(SceneNames.indices.toList()) { i ->
+                                          Box(Modifier.fillMaxWidth().height(112.dp).tvFocusable(RoundedCornerShape(24.dp), 1.03f) { s.setScene(i) }) {
+                                              SceneCanvas(i, Modifier.fillMaxSize())
+                                              Text(SceneNames[i], style = T.label, modifier = Modifier.align(Alignment.BottomStart).padding(16.dp))
+                                              if (s.scene == i) Icon(Icons.Rounded.Check, null, Modifier.align(Alignment.TopEnd).padding(14.dp).size(24.dp), tint = SoftWhite)
+                                          }
+                                      }
+                                  }
+                                  Panel.Appearance -> {
+                                      item { Row2(Icons.Rounded.ChevronLeft, "Appearance", modifier = Modifier.focusRequester(fr)) { setPanel(Panel.Main) } }
+                                      item { Label("Glass") }
+                                      item { Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                          listOf("Clear", "Balanced", "Frosted").forEachIndexed { i, n -> Pill(n, s.glass == i, { s.setGlass(i) }) }
+                                      } }
+                                      item { Label("Music backdrop") }
+                                      item { Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                          Pill("Album art", s.musicBackdrop, { s.setMusicBackdrop(true) }); Pill("Wallpaper", !s.musicBackdrop, { s.setMusicBackdrop(false) })
+                                      } }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable private fun Label(t: String) = Text(t, style = T.body.copy(fontSize = 15.sp), modifier = Modifier.padding(top = 16.dp, bottom = 4.dp, start = 8.dp))
+
+          @Composable
+          private fun Row2(icon: ImageVector, title: String, subtitle: String? = null, modifier: Modifier = Modifier, onClick: () -> Unit) {
+              Row(modifier.fillMaxWidth().heightIn(min = 68.dp).tvFocusable(RoundedCornerShape(20.dp), 1.02f, fill = true, onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
+                  verticalAlignment = Alignment.CenterVertically) {
+                  Icon(icon, null, Modifier.size(28.dp), tint = SoftWhite)
+                  Spacer(Modifier.width(16.dp))
+                  Column { Text(title, style = T.title.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Medium)); subtitle?.let { Text(it, style = T.body.copy(fontSize = 15.sp)) } }
+              }
+          }
+          EOF_X
+      - name: Download Inter fonts
+        run: |
+          mkdir -p app/src/main/res/font
+          curl -L -o inter.zip https://github.com/rsms/inter/releases/download/v4.0/Inter-4.0.zip
+          unzip -q inter.zip -d inter
+          F=app/src/main/res/font
+          cp "$(find inter -name Inter-Regular.ttf | grep -i ttf | head -1)" $F/inter_regular.ttf
+          cp "$(find inter -name Inter-Medium.ttf | grep -i ttf | head -1)" $F/inter_medium.ttf
+          cp "$(find inter -name Inter-SemiBold.ttf | grep -i ttf | head -1)" $F/inter_semibold.ttf
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PersonalTVHome-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
