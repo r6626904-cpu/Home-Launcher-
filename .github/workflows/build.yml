@@ -1,0 +1,46 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract project
+        run: |
+          unzip -q PersonalTVHome.zip
+          cd PersonalTVHome
+          echo "PROJECT_DIR=$PWD" >> $GITHUB_ENV
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Download fonts
+        working-directory: PersonalTVHome
+        run: |
+          curl -L -o inter.zip https://github.com/rsms/inter/releases/download/v4.0/Inter-4.0.zip
+          unzip -q inter.zip -d inter
+          F=app/src/main/res/font
+          cp "$(find inter -name Inter-Regular.ttf | head -1)" $F/inter_regular.ttf
+          cp "$(find inter -name Inter-Medium.ttf | head -1)" $F/inter_medium.ttf
+          cp "$(find inter -name Inter-SemiBold.ttf | head -1)" $F/inter_semibold.ttf
+
+      - name: Build APK
+        working-directory: PersonalTVHome
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PersonalTVHome-apk
+          path: PersonalTVHome/app/build/outputs/apk/debug/app-debug.apk
