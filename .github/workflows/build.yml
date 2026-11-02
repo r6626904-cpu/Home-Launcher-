@@ -35,7 +35,7 @@ jobs:
           cp "$(find inter -name Inter-Regular.ttf | head -1)" $F/inter_regular.ttf
           cp "$(find inter -name Inter-Medium.ttf | head -1)" $F/inter_medium.ttf
           cp "$(find inter -name Inter-SemiBold.ttf | head -1)" $F/inter_semibold.ttf
-
+                    rm -f app/src/main/res/font/README.txt
       - name: Build APK
         working-directory: PersonalTVHome
         run: gradle assembleDebug
