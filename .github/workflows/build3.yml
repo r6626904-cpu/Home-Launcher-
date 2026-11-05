@@ -777,6 +777,9 @@ jobs:
           cp "$(find inter -name Inter-Regular.ttf | grep -i ttf | head -1)" $F/inter_regular.ttf
           cp "$(find inter -name Inter-Medium.ttf | grep -i ttf | head -1)" $F/inter_medium.ttf
           cp "$(find inter -name Inter-SemiBold.ttf | grep -i ttf | head -1)" $F/inter_semibold.ttf
+          - name: Fix duplicate setters
+  run: |
+    find app/src -name "*.kt" -exec sed -i 's/setScene(/changeScene(/g; s/setGlass(/changeGlass(/g; s/setMusicBackdrop(/changeMusicBackdrop(/g' {} +
       - run: D=app/src/main/java/com/personaltv/home; sed -i '/val c = android.graphics.Color$/d' $D/Data.kt; sed -i 's/ c\.rgb(/ android.graphics.Color.rgb(/; s/c\.red(px)/android.graphics.Color.red(px)/; s/c\.green(px)/android.graphics.Color.green(px)/; s/c\.blue(px)/android.graphics.Color.blue(px)/' $D/Data.kt; sed -i 's/^import androidx.compose.animation.core.tween$/import androidx.compose.animation.core.*/' $D/Screens.kt; gradle assembleDebug -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" -Dkotlin.daemon.jvmargs=-Xmx3g
       - uses: actions/upload-artifact@v4
         with:
