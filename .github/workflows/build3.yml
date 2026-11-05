@@ -186,9 +186,9 @@ jobs:
                   pinned = if (a.pkg in cur) cur - a.pkg else cur + a.pkg
                   prefs.edit().putString("pinned", pinned.joinToString(",")).apply()
               }
-              fun setScene(i: Int) { scene = i; prefs.edit().putInt("scene", i).apply() }
-              fun setGlass(i: Int) { glass = i; prefs.edit().putInt("glass", i).apply() }
-              fun setMusicBackdrop(b: Boolean) { musicBackdrop = b; prefs.edit().putBoolean("musicBg", b).apply() }
+              @JvmName("applyScene") fun setScene(i: Int) { scene = i; prefs.edit().putInt("scene", i).apply() }
+              @JvmName("applyGlass") fun setGlass(i: Int) { glass = i; prefs.edit().putInt("glass", i).apply() }
+              @JvmName("applyMusicBackdrop") fun setMusicBackdrop(b: Boolean) { musicBackdrop = b; prefs.edit().putBoolean("musicBg", b).apply() }
           }
           EOF_X
           mkdir -p app/src/main/java/com/personaltv/home
